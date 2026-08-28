@@ -83,8 +83,8 @@ HEADERS = {
 
 REQUEST_TIMEOUT = 15
 
-OUTPUT_FILE = "backtest_results_2025_2026_nfl.csv"
-SKIPPED_FILE = "backtest_skipped_2025_2026_nfl.csv"
+OUTPUT_FILE = "pre_game_backtest_results_2025_2026_nfl.csv"
+SKIPPED_FILE = "pre_game_backtest_skipped_2025_2026_nfl.csv"
 
 
 # ============================================================

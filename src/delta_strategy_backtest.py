@@ -1,5 +1,7 @@
 import csv
 import sys
+import requests
+
 from datetime import datetime, timezone
 
 from src.delta_strategy import (
@@ -26,7 +28,32 @@ from src.historical_kalshi import (
 # CONFIGURATION
 # ============================================================
 
-INPUT_FILE = "backtest_results_2025_2026_nfl.csv"
+KALSHI_BASE_URL = (
+    "https://external-api.kalshi.com/trade-api/v2"
+)
+
+SERIES_TICKER = "KXNFLGAME"
+
+START_DATE = datetime(
+    2025,
+    9,
+    1,
+    tzinfo=timezone.utc,
+)
+
+END_DATE = datetime(
+    2026,
+    2,
+    8,
+    23,
+    59,
+    59,
+    tzinfo=timezone.utc,
+)
+
+OUTPUT_FILE = (
+    "delta_strategy_results_2025_2026_nfl.csv"
+)
 
 WINDOW_SECONDS = 5 * 60
 MIN_KALSHI_MOVE = 0.10
@@ -65,11 +92,6 @@ def parse_date(value):
     )
 
 
-def load_games(path):
-    with open(path, newline="") as f:
-        return list(csv.DictReader(f))
-
-
 def normalize_team(team):
     mapping = {
         "WAS": "WSH",
@@ -81,6 +103,269 @@ def normalize_team(team):
         team.strip().upper(),
         team.strip().upper(),
     )
+
+
+# ============================================================
+# LOAD NFL GAMES DIRECTLY FROM HISTORICAL KALSHI MARKETS
+# ============================================================
+
+def load_games_from_kalshi():
+    """
+    Load the NFL game list directly from Kalshi's historical
+    markets endpoint.
+
+    Each NFL event has an event ticker such as:
+
+        KXNFLGAME-25SEP04DALPHI
+
+    and team-specific market tickers such as:
+
+        KXNFLGAME-25SEP04DALPHI-DAL
+        KXNFLGAME-25SEP04DALPHI-PHI
+
+    We use the HOME team market ticker as the representative
+    market for the game. The binary NO side represents the
+    away team, so this preserves the one-market-per-game
+    structure used by the previous backtest.
+    """
+
+    url = (
+        f"{KALSHI_BASE_URL}/historical/markets"
+    )
+
+    markets = []
+    cursor = None
+    page_number = 0
+
+    print(
+        "Loading historical NFL markets from Kalshi..."
+    )
+
+    while True:
+
+        params = {
+            "series_ticker": SERIES_TICKER,
+            "limit": 1000,
+        }
+
+        if cursor:
+            params["cursor"] = cursor
+
+        response = requests.get(
+            url,
+            params=params,
+            timeout=30,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        page_markets = data.get(
+            "markets",
+            [],
+        )
+
+        markets.extend(
+            page_markets
+        )
+
+        page_number += 1
+
+        print(
+            f"  Page {page_number}: "
+            f"{len(page_markets)} markets "
+            f"(total {len(markets)})"
+        )
+
+        cursor = data.get(
+            "cursor"
+        )
+
+        if not cursor:
+            break
+
+    print(
+        f"  Historical Kalshi markets returned: "
+        f"{len(markets)}"
+    )
+
+    # ========================================================
+    # GROUP TEAM MARKETS BY EVENT
+    # ========================================================
+
+    events = {}
+
+    for market in markets:
+
+        ticker = market.get(
+            "ticker",
+            "",
+        )
+
+        event_ticker = market.get(
+            "event_ticker",
+            "",
+        )
+
+        if not ticker:
+            continue
+
+        if not event_ticker:
+            continue
+
+        if not event_ticker.startswith(
+            SERIES_TICKER + "-"
+        ):
+            continue
+
+        events.setdefault(
+            event_ticker,
+            []
+        ).append(
+            market
+        )
+
+    games = []
+
+    # ========================================================
+    # PARSE NFL EVENTS
+    # ========================================================
+
+    for event_ticker, event_markets in events.items():
+
+        parts = event_ticker.split("-")
+
+        if len(parts) != 2:
+            continue
+
+        game_code = parts[1]
+
+        # ----------------------------------------------------
+        # NFL EVENT FORMAT:
+        #
+        # 25SEP04DALPHI
+        #
+        # 25SEP04 = date
+        # DAL     = away
+        # PHI     = home
+        #
+        # Total = 13 characters
+        # ----------------------------------------------------
+
+        if len(game_code) != 13:
+            continue
+
+        date_code = game_code[:7]
+        away_team = game_code[7:10]
+        home_team = game_code[10:13]
+
+        try:
+
+            game_date = datetime.strptime(
+                date_code,
+                "%y%b%d",
+            ).replace(
+                tzinfo=timezone.utc
+            )
+
+        except ValueError:
+
+            continue
+
+        # ----------------------------------------------------
+        # DATE FILTER
+        # ----------------------------------------------------
+
+        if game_date < START_DATE:
+            continue
+
+        if game_date > END_DATE:
+            continue
+
+        # ----------------------------------------------------
+        # FIND HOME-TEAM MARKET
+        #
+        # This is the market we use as the representative
+        # binary market for the game.
+        # ----------------------------------------------------
+
+        home_ticker = None
+
+        for market in event_markets:
+
+            ticker = market.get(
+                "ticker",
+                "",
+            )
+
+            suffix = ticker.rsplit(
+                "-",
+                1,
+            )[-1]
+
+            if suffix == home_team:
+
+                home_ticker = ticker
+                break
+
+        if home_ticker is None:
+            continue
+
+        games.append({
+
+            "date":
+                game_date.strftime(
+                    "%Y-%m-%d"
+                ),
+
+            "away_team":
+                away_team,
+
+            "home_team":
+                home_team,
+
+            "ticker":
+                home_ticker,
+
+            "event_ticker":
+                event_ticker,
+        })
+
+    # ========================================================
+    # DEDUPLICATE GAMES
+    # ========================================================
+
+    unique_games = {}
+
+    for game in games:
+
+        key = (
+            game["date"],
+            game["away_team"],
+            game["home_team"],
+        )
+
+        unique_games[key] = game
+
+    games = list(
+        unique_games.values()
+    )
+
+    games.sort(
+        key=lambda game: (
+            game["date"],
+            game["away_team"],
+            game["home_team"],
+        )
+    )
+
+    print(
+        f"  NFL games in requested range: "
+        f"{len(games)}"
+    )
+
+    return games
 
 
 # ============================================================
@@ -96,8 +381,6 @@ def inspect_game(
     """
     Generate valid delta signals for one game.
 
-    IMPORTANT:
-
     This intentionally uses the known-working ESPN path:
 
         src.espn.build_espn_probability_series()
@@ -105,8 +388,6 @@ def inspect_game(
     rather than generate_delta_signals() from delta_strategy.py.
 
     We do NOT modify the strategy's underlying signal logic.
-
-    No rejected trades are printed in the full backtest.
     """
 
     # --------------------------------------------------------
@@ -177,8 +458,13 @@ def inspect_game(
         # REQUIRE DIFFERENT ESPN PLAYS
         # ----------------------------------------------------
 
-        start_play_id = start_espn.get("play_id")
-        end_play_id = end_espn.get("play_id")
+        start_play_id = start_espn.get(
+            "play_id"
+        )
+
+        end_play_id = end_espn.get(
+            "play_id"
+        )
 
         if (
             start_play_id is not None
@@ -211,7 +497,9 @@ def inspect_game(
             if end_play_id in used_end_plays:
                 continue
 
-            used_end_plays.add(end_play_id)
+            used_end_plays.add(
+                end_play_id
+            )
 
         # ----------------------------------------------------
         # DELTA CALCULATION
@@ -241,7 +529,9 @@ def inspect_game(
             - kalshi_delta
         )
 
-        edge = abs(discrepancy)
+        edge = abs(
+            discrepancy
+        )
 
         # ----------------------------------------------------
         # EDGE REQUIREMENT
@@ -274,7 +564,9 @@ def inspect_game(
             "ESPN_WALLCLOCK"
         )
 
-        signals.append(signal)
+        signals.append(
+            signal
+        )
 
     return signals
 
@@ -288,17 +580,22 @@ def get_winner(game):
     Return 'home' or 'away' based on the ESPN game result.
     """
 
-    home_winner = game.get("home_winner")
+    home_winner = game.get(
+        "home_winner"
+    )
 
     if home_winner is True:
         return "home"
 
     if home_winner is False:
 
-        # ESPN explicitly says home did not win.
-        # Verify we have a usable away result below.
-        home_score = game.get("home_score")
-        away_score = game.get("away_score")
+        home_score = game.get(
+            "home_score"
+        )
+
+        away_score = game.get(
+            "away_score"
+        )
 
         if (
             home_score is not None
@@ -308,10 +605,13 @@ def get_winner(game):
             if away_score > home_score:
                 return "away"
 
-    # Fallback to scores.
+    home_score = game.get(
+        "home_score"
+    )
 
-    home_score = game.get("home_score")
-    away_score = game.get("away_score")
+    away_score = game.get(
+        "away_score"
+    )
 
     if (
         home_score is not None
@@ -358,12 +658,16 @@ def calculate_trade_result(
 
     edge = signal["edge"]
 
-    stake = edge_to_bet_size(edge)
+    stake = edge_to_bet_size(
+        edge
+    )
 
     if stake <= 0:
         return None
 
-    traded_side = signal["traded_side"]
+    traded_side = signal[
+        "traded_side"
+    ]
 
     entry_price = select_entry_price(
         signal
@@ -466,7 +770,8 @@ def print_trade(
     print()
 
     print(
-        f"Trade: {trade['traded_side'].upper()}"
+        f"Trade: "
+        f"{trade['traded_side'].upper()}"
     )
 
     print(
@@ -503,6 +808,74 @@ def print_trade(
 
 
 # ============================================================
+# WRITE RESULTS CSV
+# ============================================================
+
+def write_results_csv(
+    trades,
+    path,
+):
+    """
+    Write every completed trade to the Delta Strategy
+    results CSV.
+    """
+
+    if not trades:
+
+        print(
+            f"No trades to write to {path}."
+        )
+
+        return
+
+    fieldnames = [
+        "game_id",
+        "date",
+        "away_team",
+        "home_team",
+        "winner",
+        "traded_side",
+        "interval_start",
+        "interval_end",
+        "kalshi_start",
+        "kalshi_end",
+        "kalshi_move",
+        "espn_yes_delta",
+        "delta_discrepancy",
+        "edge",
+        "entry_price",
+        "stake",
+        "contracts",
+        "payout",
+        "won",
+        "pnl",
+    ]
+
+    with open(
+        path,
+        "w",
+        newline="",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+        )
+
+        writer.writeheader()
+
+        writer.writerows(
+            trades
+        )
+
+    print()
+    print(
+        f"Wrote {len(trades)} trades to "
+        f"{path}"
+    )
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -514,46 +887,94 @@ def main():
 
     print()
     print("Strategy:")
+
     print(
-        f"  Kalshi movement: >= {MIN_KALSHI_MOVE:.0%} "
-        f"over exactly {WINDOW_SECONDS // 60} minutes"
+        f"  Kalshi movement: >= "
+        f"{MIN_KALSHI_MOVE:.0%} "
+        f"over exactly "
+        f"{WINDOW_SECONDS // 60} minutes"
     )
+
     print(
-        f"  Delta edge: > {MIN_DELTA_EDGE:.0%}"
+        f"  Delta edge: > "
+        f"{MIN_DELTA_EDGE:.0%}"
     )
+
     print(
         f"  ESPN alignment: <= "
         f"{MAX_ESPN_ALIGNMENT_SECONDS} seconds"
     )
+
     print(
         "  Bet sizing: dynamic ($10 / $15 / $20)"
     )
+
     print(
         "  Entry: Kalshi price at end of movement"
     )
+
     print(
         "  P&L: binary contract, before fees"
     )
+
     print()
+
+    print(
+        f"Kalshi series: "
+        f"{SERIES_TICKER}"
+    )
+
+    print(
+        f"Date range: "
+        f"{START_DATE.date()} -> "
+        f"{END_DATE.date()}"
+    )
+
+    print()
+
+    # ========================================================
+    # LOAD GAME LIST DIRECTLY FROM KALSHI
+    # ========================================================
 
     try:
 
-        rows = load_games(
-            INPUT_FILE
-        )
+        rows = load_games_from_kalshi()
 
-    except FileNotFoundError:
+    except requests.RequestException as e:
 
         print(
-            f"Could not find input file: "
-            f"{INPUT_FILE}"
+            "Could not load historical NFL markets "
+            "from Kalshi:"
+        )
+
+        print(
+            f"  {type(e).__name__}: {e}"
+        )
+
+        sys.exit(1)
+
+    except Exception as e:
+
+        print(
+            "Could not construct NFL game list:"
+        )
+
+        print(
+            f"  {type(e).__name__}: {e}"
+        )
+
+        sys.exit(1)
+
+    if not rows:
+
+        print(
+            "No NFL games found."
         )
 
         sys.exit(1)
 
     print(
-        f"Loaded {len(rows)} games from "
-        f"{INPUT_FILE}"
+        f"Loaded {len(rows)} NFL games."
     )
 
     print()
@@ -588,7 +1009,10 @@ def main():
     # PROCESS GAMES
     # ========================================================
 
-    for row_number, row in enumerate(rows, 1):
+    for row_number, row in enumerate(
+        rows,
+        1,
+    ):
 
         away_team = (
             row.get("away_team")
@@ -635,10 +1059,14 @@ def main():
             game = find_game(
                 home_team=home_team,
                 away_team=away_team,
-                game_date=parse_date(date),
+                game_date=parse_date(
+                    date
+                ),
             )
 
-            kickoff = game["start_time"]
+            kickoff = game[
+                "start_time"
+            ]
 
             game_data = get_game_data(
                 game["id"]
@@ -664,7 +1092,9 @@ def main():
             # KALSHI YES SIDE
             # ------------------------------------------------
 
-            yes_team = ticker.split("-")[-1]
+            yes_team = ticker.split(
+                "-"
+            )[-1]
 
             normalized_yes = normalize_team(
                 yes_team
@@ -876,8 +1306,11 @@ def main():
                 )
 
                 if result["won"]:
+
                     wins += 1
+
                 else:
+
                     losses += 1
 
                 if signal["traded_side"] == "home":
@@ -907,6 +1340,7 @@ def main():
             print(
                 "Stopped by user."
             )
+
             break
 
         except Exception as e:
@@ -915,6 +1349,15 @@ def main():
                 f"  ERROR: "
                 f"{type(e).__name__}: {e}"
             )
+
+    # ========================================================
+    # WRITE TRADE RESULTS
+    # ========================================================
+
+    write_results_csv(
+        trades,
+        OUTPUT_FILE,
+    )
 
     # ========================================================
     # FINAL SUMMARY
@@ -1071,7 +1514,11 @@ def main():
     print("BY BET SIZE")
     print("-" * 120)
 
-    for size in [10.0, 15.0, 20.0]:
+    for size in [
+        10.0,
+        15.0,
+        20.0,
+    ]:
 
         size_trades = [
             trade
