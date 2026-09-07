@@ -10,22 +10,31 @@ def get_nfl_markets():
     Get active NFL game markets from Kalshi.
     """
 
-    params = {
-        "series_ticker": "KXNFLGAME",
-        "limit": 100,
-    }
+    markets = []
+    cursor = None
 
-    response = requests.get(
-        KALSHI_MARKETS_URL,
-        params=params,
-        timeout=10,
-    )
+    # The public API returns the newest markets first.  Opening-week games can
+    # be on later pages once the rest of the season is listed, so follow the
+    # cursor instead of silently inspecting only the first 100.
+    while True:
+        params = {
+            "series_ticker": "KXNFLGAME",
+            "limit": 1000,
+        }
+        if cursor:
+            params["cursor"] = cursor
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    return data.get("markets", [])
+        response = requests.get(
+            KALSHI_MARKETS_URL,
+            params=params,
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        markets.extend(data.get("markets", []))
+        cursor = data.get("cursor")
+        if not cursor:
+            return markets
 
 
 def get_orderbook(ticker):

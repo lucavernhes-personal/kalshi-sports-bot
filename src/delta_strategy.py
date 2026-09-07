@@ -854,10 +854,6 @@ def generate_delta_signals(
 
     for observation in espn_series:
 
-        timestamp_source = observation.get(
-            "timestamp_source"
-        )
-
         wallclock = observation.get(
             "wallclock"
         )
@@ -865,9 +861,6 @@ def generate_delta_signals(
         timestamp = observation.get(
             "timestamp"
         )
-
-        if timestamp_source != "ESPN_WALLCLOCK":
-            continue
 
         if wallclock is None:
             continue
